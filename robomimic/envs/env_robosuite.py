@@ -52,10 +52,12 @@ class EnvRobosuite(EB.EnvBase):
         """
         self.postprocess_visual_obs = postprocess_visual_obs
 
-        # robosuite version check
+        # # robosuite version check
         self._is_v1 = (robosuite.__version__.split(".")[0] == "1")
         if self._is_v1:
             assert (int(robosuite.__version__.split(".")[1]) >= 2), "only support robosuite v0.3 and v1.2+"
+        # # 24.11.12 20.43 改
+        # self._is_v1 = True
 
         kwargs = deepcopy(kwargs)
 
@@ -324,7 +326,8 @@ class EnvRobosuite(EB.EnvBase):
             camera_width (int): camera width for all cameras
             reward_shaping (bool): if True, use shaped environment rewards, else use sparse task completion rewards
         """
-        is_v1 = (robosuite.__version__.split(".")[0] == "1")
+        # is_v1 = (robosuite.__version__.split(".")[0] == "1")
+        is_v1 = True
         has_camera = (len(camera_names) > 0)
 
         new_kwargs = {

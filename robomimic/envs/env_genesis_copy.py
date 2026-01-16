@@ -5,8 +5,23 @@ import numpy as np
 from pyquaternion import Quaternion
 import cv2
 import time
+import os
+
+
+# 用于将上下文传递给 is_success 函数的辅助类
+class ConditionContext:
+    def __init__(self, scene, robot, movable_objects):
+        self.scene = scene
+        self.franka = robot
+        self.movable_objects = movable_objects
 
 class GenesisEnvWrapper(EB.EnvBase):
+    """
+    一个与 robomimic 兼容的 Genesis 环境封装器。
+    这个封装器精确地复现了 data_collection.py 脚本中定义的桌面环境，
+    确保了状态表示和动作执行的一致性，从而能够正确回放采集的数据。
+    """
+
     def __init__(self, env_name=None, env_config=None, camera_width=84, camera_height=84, **kwargs):
         if env_name is not None:
             if env_config is None:
@@ -17,97 +32,118 @@ class GenesisEnvWrapper(EB.EnvBase):
             env_config = {}
 
         self.custom_is_success = None
+        # 如果 env_config 中有 condition_file，则加载它
+        self.condition_file = env_config.get("condition_file", None)
+        if self.condition_file and os.path.exists(self.condition_file):
+            self._load_condition_file()
 
         # 调用父类构造函数
         super().__init__(env_config, env_type=EnvType.GENESIS, **kwargs)
 
         self.reward_shaping = False
         self.post_process_images = False
-        # 添加时间控制变量
+
+        # 与数据采集脚本一致的机器人控制参数
         self.motors_dof = np.arange(7)
         self.fingers_dof = np.arange(7, 9)
+        # 夹爪控制参数 - 不再需要上次夹爪信号
+        self.GRASP_FORCE = 10.0  # 夹持力常数
 
-        self.last_gripper_signal = -1.0
-
-        # 初始化 Genesis 场景
+        # 1. 初始化 Genesis 场景 (与采集脚本完全一致)
         gs.init(backend=gs.gpu)
         self.scene = gs.Scene(
             viewer_options=gs.options.ViewerOptions(
-                camera_pos=(3, -1, 1.5),
-                camera_lookat=(0.0, 0.0, 0.5),
+                camera_pos=(2.5, 1.0, 1.8),
+                camera_lookat=(0.65, 1.0, 1.0),
                 camera_fov=30,
                 max_FPS=60,
             ),
             sim_options=gs.options.SimOptions(dt=0.01, substeps=4),
-            show_viewer=False,
+            show_viewer=False,  # 通常在训练/回放时关闭默认查看器
             show_FPS=False
         )
-
         self.env = self.scene
         self.simulator = self.env
+
+        # 2. 添加所有场景实体 (与采集脚本完全一致)
+        self.plane = self.scene.add_entity(gs.morphs.Plane())
         self.robot = self.scene.add_entity(
-            gs.morphs.MJCF(file="/home/yujp/Genesis/genesis/assets/xml/franka_emika_panda/panda.xml")
+            gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml",
+                           pos=(0.0, 1.0, 0.88))
         )
-        self.scene.add_entity(gs.morphs.Plane())
-        self.scene.add_entity(gs.morphs.Box(size=(0.04, 0.04, 0.04), pos=(0.65, 0.0, 0.02)))
-        self.scene.add_entity(
-            morph=gs.morphs.Mesh(
-                file="/home/yujp/Genesis/my_models/wooden_two_layer_shelf/wooden_two_layer_shelf.obj",
-                scale=0.1,
-                pos=(0.0, 0.75, 0.0),
+        self.desk_scene = self.scene.add_entity(
+            gs.morphs.MJCF(
+                file="/home/yujp/Genesis/my_models/scenes/libero_study_base_style.xml",
+                pos=(0.5, 1.0, 0.0), scale=1.0,
             )
         )
-
-        self.scene.add_entity(
-            gs.morphs.Box(size=(0.06, 0.06, 0.02), pos=(0.5, 0.0, 0.01)),
-            surface=gs.surfaces.Default(color=(1.0, 0, 0, 1.0))
+        self.shelf = self.scene.add_entity(
+            gs.morphs.MJCF(
+                file="/home/yujp/Genesis/my_models/turbosquid_objects/wooden_shelf/wooden_shelf.xml",
+                pos=(0.6, 0.65, 0.88), quat=(0, 0, 0, 1), scale=1,
+            )
+        )
+        self.tray = self.scene.add_entity(
+            gs.morphs.MJCF(
+                file="/home/yujp/Genesis/my_models/turbosquid_objects/wooden_tray/wooden_tray.xml",
+                pos=(0.4, 1.3, 0.88), scale=1
+            )
+        )
+        self.box = self.scene.add_entity(
+            gs.morphs.MJCF(
+                file="/home/yujp/Genesis/my_models/turbosquid_objects/white_storage_box/white_storage_box.xml",
+                pos=(0.35, 0.8, 0.88), scale=1,
+            )
+        )
+        self.object_1 = self.scene.add_entity(
+            gs.morphs.Mesh(
+                file="/home/yujp/Genesis/my_models/turbosquid_objects/black_book/black_book.obj",
+                pos=(0.7, 0.85, 0.88), quat=(0.7, 0, 0, 0.7), scale=0.3
+            ),
+            # material=gs.materials.Rigid(rho=0.01)
+        )
+        self.object_2 = self.scene.add_entity(
+            gs.morphs.Mesh(
+                file="/home/yujp/Genesis/my_models/stable_hope_objects/cream_cheese/cream_cheese.obj",
+                pos=(0.75, 1.15, 1.0), quat=(0, 0, 0.707, 0.707), scale=0.015
+            ),
+            # material=gs.materials.Rigid(rho=0.01)
+        )
+        self.object_3 = self.scene.add_entity(
+            gs.morphs.Mesh(
+                file="/home/yujp/Genesis/my_models/stable_hope_objects/macaroni_and_cheese/textured.obj",
+                pos=(0.75, 1.0, 0.88), quat=(0, 0, 0.707, 0.707), scale=0.007
+            ),
+            # material=gs.materials.Rigid(rho=0.01)
         )
 
-        # 添加摄像头
+        # 3. 设置摄像头 (使用 robomimic 命名约定)
         self.camera_width = camera_width
         self.camera_height = camera_height
         self.cameras = {}
 
-        # 全局视角摄像头（固定）
-        self.cameras["agentview"] = self.scene.add_camera(
+        self.cameras["agentview_image"] = self.scene.add_camera(
             res=(self.camera_width, self.camera_height),
-            pos=(2.5, 0, 1.2),
-            lookat=(0.65, 0.0, 0.25),
-            fov=30,
-            GUI=False
+            pos=(2.5, 1.0, 1.8), lookat=(0.65, 1.0, 1.0), fov=30, GUI=False
         )
-
-        # 腕部视角摄像头（动态调整位置）
-        self.cameras["gripper_view"] = self.scene.add_camera(
-            res=(self.camera_width, self.camera_height),
-            pos=(0, 0, 0),  # 位置后续动态更新
-            lookat=(0, 0, 0),
-            fov=60,
-            GUI=False
-        )
-
-        # 末端执行器视角摄像头（动态调整位置） - 名称与观测键统一
         self.cameras["robot0_eye_in_hand_image"] = self.scene.add_camera(
             res=(self.camera_width, self.camera_height),
-            pos=(0, 0, 0),  # 位置后续动态更新
-            lookat=(0, 0, 0),
-            fov=60,
-            GUI=False
+            pos=(0, 0, 0), lookat=(0, 0, 0), fov=60, GUI=False
         )
-
-        # 高分辨率渲染摄像头（可选）
+        self.cameras["robot0_wrist_image"] = self.scene.add_camera(
+            res=(self.camera_width, self.camera_height),
+            pos=(0, 0, 0), lookat=(0, 0, 0), fov=60, GUI=False
+        )
+        # 用于高质量渲染的摄像头
         self.cameras["render_view"] = self.scene.add_camera(
             res=(512, 512),
-            pos=(2.5, 0, 1.2),
-            lookat=(0.65, 0.0, 0.25),
-            fov=30,
-            GUI=False
+            pos=(2.5, 1.0, 1.8), lookat=(0.65, 1.0, 1.0), fov=30, GUI=False
         )
 
         # 构建场景
         self.scene.build()
 
-        # 初始化依赖场景构建的组件
+        # 4. 初始化依赖场景构建的组件
         self.end_effector = self.robot.get_link("hand")
         self.robot.set_dofs_kp([4500, 4500, 3500, 3500, 2000, 2000, 2000, 100, 100])
         self.robot.set_dofs_kv([450, 450, 350, 350, 200, 200, 200, 10, 10])
@@ -116,15 +152,32 @@ class GenesisEnvWrapper(EB.EnvBase):
             [87, 87, 87, 87, 12, 12, 12, 100, 100]
         )
 
-        # 初始目标位置和姿态
-        self.current_pos = np.array([0.65, 0.0, 0.3])
-        self.current_quat = np.array([0, 1, 0, 0])  # [w, x, y, z]
+        # 5. 管理可移动物体 (与采集脚本一致)
+        # MovableObject 辅助类
+        class MovableObject:
+            def __init__(self, entity, initial_pos, initial_quat):
+                self.entity = entity
+                self.initial_pos = np.array(initial_pos)
+                self.initial_quat = np.array(initial_quat)
 
-        # 新增与数据收集一致的常量
-        self.SPEED_XY = 0.5      # 平面移动速度（米/秒）
-        self.SPEED_Z = 0.2       # 垂直移动速度（米/秒）
-        self.ROT_SPEED = 1.0     # 旋转速度（弧度/秒）
-        self.DATA_INTERVAL = 0.05  # 20Hz数据记录间隔
+            def get_state(self):
+                pos = self.entity.get_pos().cpu().numpy().squeeze()
+                quat = self.entity.get_quat().cpu().numpy().squeeze()
+                vel = self.entity.get_vel().cpu().numpy().squeeze()
+                ang = self.entity.get_ang().cpu().numpy().squeeze()
+                return pos, quat, vel, ang
+
+        self.movable_objects = [
+            MovableObject(self.object_1, [0.7, 0.85, 0.88], [0.7, 0, 0, 0.7]),
+            MovableObject(self.object_2, [0.75, 1.15, 0.93], [0, 0, 0.707, 0.707]),
+            MovableObject(self.object_3, [0.75, 1.0, 0.96], [0, 0, 0.707, 0.707])
+        ]
+
+        # 6. 初始化控制状态
+        self.init_qpos = np.array([-2.0988, -1.4417,  1.5711, -1.7141,  1.4430,  1.5895,  0.1152,  0.04, 0.04])
+        # 将在 reset() 中初始化
+        self.current_pos = None
+        self.current_quat = None
 
     @classmethod
     def create_for_data_processing(cls, env_name, camera_height, camera_width, reward_shaping, **kwargs):
@@ -154,210 +207,168 @@ class GenesisEnvWrapper(EB.EnvBase):
         env.reward_shaping = reward_shaping
         return env
 
-    # def step(self, action):
-    #     delta_pos = action[:3]
-    #     delta_rot_vec = action[3:6]
-    #     gripper_signal = action[6]
-    #
-    #     # 1. 位置更新
-    #     self.current_pos += delta_pos
-    #
-    #     # 2. 姿态更新
-    #     angle = np.linalg.norm(delta_rot_vec)
-    #     if angle > 1e-6:  # 避免除以零
-    #         axis = delta_rot_vec / angle
-    #         q_inc = Quaternion(axis=axis, angle=angle)  # 从数据中读取的“世界坐标系”旋转 (The world-frame rotation from data)
-    #         q_current = Quaternion(self.current_quat)  # 上一步的姿态 (Orientation from previous step)
-    #
-    #         # --- 核心修改 / CORE FIX ---
-    #         # 您的数据动作用 q_current * q_last.inverse 计算，这是一个世界坐标系下的旋转。
-    #         # 因此，在应用它时，需要使用前乘 (pre-multiplication) 来更新姿态。
-    #         # Your data action was calculated with q_current * q_last.inverse, which is a rotation in the WORLD frame.
-    #         # Therefore, to apply it, you must use pre-multiplication.
-    #         #
-    #         # 原代码 (Original Code - applies rotation in LOCAL frame):
-    #         # q_new = q_current * q_inc
-    #         #
-    #         # 修改后代码 (Corrected Code - applies rotation in WORLD frame):
-    #         q_new = q_inc * q_current
-    #
-    #         self.current_quat = q_new.normalised.elements
-    #
-    #     # 通过逆运动学计算新的关节角度
-    #     qpos = self.robot.inverse_kinematics(link=self.end_effector, pos=self.current_pos, quat=self.current_quat)
-    #
-    #     # 控制机械臂前7个关节和夹爪
-    #     self.robot.control_dofs_position(qpos[:-2], self.motors_dof)
-    #     gripper_target = 0.0 if gripper_signal > 0 else 0.04
-    #     self.robot.control_dofs_position([gripper_target, gripper_target], self.fingers_dof)
-    #
-    #     # 根据控制频率推进仿真 (保持时间同步)
-    #     control_freq = 20
-    #     action_duration = 1.0 / control_freq
-    #     sim_dt = self.scene.sim_options.dt
-    #     num_sim_steps = int(round(action_duration / sim_dt))
-    #
-    #     for _ in range(num_sim_steps):
-    #         self.scene.step()
-    #
-    #     # 获取观测信息
-    #     obs = self.get_observation()
-    #     reward = self.get_reward()
-    #     done = self.is_done()
-    #
-    #     return obs, reward, done, {}
-
     def step(self, action):
         """
         根据采集的动作指令，在仿真环境中执行一步。
         action: 包含位置、旋转和夹爪控制的7维向量。
                 - action[0:3]: delta_pos (世界坐标系下的位置增量)
-                - action[3:6]: delta_rot_vec (世界坐标系下的旋转矢量)
-                - action[6]:   gripper_signal (夹爪信号, >0 表示闭合)
+                - action[3:6]: delta_rot (世界坐标系下的旋转矢量)
+                - action[6]:   gripper_signal (夹爪信号, >0 表示闭合, <=0 表示张开)
         """
         # 1. 解析动作
-        delta_pos = action[:3]
-        delta_rot_vec = action[3:6]
+        # NOTE: 缩放后的数据集中位置动作放大了,此处需还原
+        delta_pos = np.clip(action[:3], -1.0, 1.0)
+        delta_pos = action[:3] / 400.0
+        delta_rot_vec = action[3:6] / 50.0
         gripper_signal = action[6]
 
-        # 2. 更新目标位置 (直接在世界坐标系下累加，这是正确的)
+        # 2. 更新目标位置 (直接在世界坐标系下累加)
         self.current_pos += delta_pos
 
         # 3. 更新目标姿态
         angle = np.linalg.norm(delta_rot_vec)
-        # 只有在旋转角度不为零时才更新姿态，避免计算错误
         if angle > 1e-6:
             axis = delta_rot_vec / angle
-            # 将旋转矢量转换为增量四元数 q_inc
-            q_inc = Quaternion(axis=axis, angle=angle)
-            # 获取当前姿态的四元数
-            q_current = Quaternion(self.current_quat)
-
-            # --- 核心修正 (THE CORE FIX) ---
-            # 采集的动作是在世界坐标系下的旋转增量，因此必须使用前乘 (pre-multiplication)
+            q_inc = Quaternion(axis=axis, angle=angle)  # 增量旋转
+            q_current = Quaternion(self.current_quat)  # 当前姿态
+            # 核心: 采集的动作是在世界坐标系下的旋转增量, 因此使用前乘
             # q_new = 世界旋转增量 * 当前世界姿态
             q_new = q_inc * q_current
-
-            # 更新并归一化姿态
             self.current_quat = q_new.normalised.elements
 
         # 4. 应用逆运动学 (IK)
-        # 使用更新后的目标位姿，计算机器人各关节所需的目标角度
         qpos = self.robot.inverse_kinematics(
-            link=self.end_effector,
-            pos=self.current_pos,
-            quat=self.current_quat
+            link=self.end_effector, pos=self.current_pos, quat=self.current_quat
         )
-
-        # 5. 控制机器人
-        # 控制机械臂主臂（前7个自由度）
         self.robot.control_dofs_position(qpos[:-2], self.motors_dof)
 
-        # 控制夹爪 (根据信号判断目标开合度)
-        # 优化：仅当夹爪信号从上一步到这一步发生变化时，才发送新指令，避免重复
-        if gripper_signal != self.last_gripper_signal:
-            # gripper_signal > 0 代表闭合指令
-            if gripper_signal > 0:
-                gripper_target = 0.0  # 闭合位置
-            # gripper_signal <= 0 代表张开指令
-            else:
-                gripper_target = 0.04  # 张开位置
+        # 5. 控制夹爪 (修改为使用力控制)
+        if gripper_signal > 0:  # 闭合夹爪
+            # 使用力控闭合夹爪，施加一个固定的内向力
+            self.robot.control_dofs_force([-self.GRASP_FORCE, -self.GRASP_FORCE], self.fingers_dof)
+            # self.robot.control_dofs_position([0.0, 0.0], self.fingers_dof)
+        else:  # 张开夹爪
+            # 使用位控打开夹爪，确保完全打开
+            self.robot.control_dofs_position([0.04, 0.04], self.fingers_dof)
 
-            # 发送控制指令
-            self.robot.control_dofs_position([gripper_target, gripper_target], self.fingers_dof)
-
-            # 更新最后一次的信号状态，为下一次比较做准备
-            self.last_gripper_signal = gripper_signal
-
-        # 6. 推进仿真
-        # 为了与数据采集频率 (20Hz) 保持同步，每个action执行固定的仿真步数
-        control_freq = 20  # 20Hz
+        # 6. 推进仿真以匹配控制频率 (20Hz)
+        control_freq = 20
         action_duration = 1.0 / control_freq
         sim_dt = self.scene.sim_options.dt
         num_sim_steps = int(round(action_duration / sim_dt))
-
         for _ in range(num_sim_steps):
             self.scene.step()
 
         # 7. 获取结果
         obs = self.get_observation()
         reward = self.get_reward()
-        done = self.is_done()
-
+        done = self.is_done()["task"]
         return obs, reward, done, {}
 
     def reset(self):
-        # 重置仿真环境
+        """重置环境到初始状态，包括对可移动物体位置的随机化。"""
         self.simulator.reset()
 
-        self.last_gripper_signal = -1.0
+        # 重置机器人目标位姿 (使用固定的初始关节配置)
+        self.robot.set_dofs_position(self.init_qpos)
 
-        # 重置末端执行器目标状态到初始值
-        self.current_pos = np.array([0.65, 0.0, 0.3])
-        self.current_quat = np.array([0, 1, 0, 0])
-
-        # 使用逆运动学计算初始位置的关节角度
-        qpos = self.robot.inverse_kinematics(
-            link=self.end_effector,
-            pos=self.current_pos,
-            quat=self.current_quat
-        )
-
-        # 设置机械臂关节角度
-        self.robot.set_dofs_position(qpos)
-        self.scene.step()
-
-        # 重置方块位置 - 添加随机化
-        cube_entity = self.scene.entities[2]
-        target = self.scene.entities[4]
-
-        # 添加随机位置设置
-        cube_x = np.random.uniform(0.6, 0.7)  # 在X轴上随机位置
-        cube_y = np.random.uniform(-0.05, 0.05)  # 在Y轴上随机位置
-        cube_z = 0.02  # Z轴固定高度
-
-        cube_entity.set_pos(np.array([cube_x, cube_y, cube_z]))
-        cube_entity.set_quat(np.array([1, 0, 0, 0]))
-
-        target.set_pos(np.array([0.5, 0.0, 0.01]))
-        target.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))
+        # 重置所有可移动物体位置（带随机偏移）
+        for obj in self.movable_objects:
+            rand_offset = np.random.uniform(-0.01, 0.01, 2)
+            reset_pos = obj.initial_pos.copy()
+            reset_pos[0] += rand_offset[0]
+            reset_pos[1] += rand_offset[1]
+            obj.entity.set_pos(reset_pos)
+            obj.entity.set_quat(obj.initial_quat.copy())
 
         self.scene.step()
 
-        print(f"重置方块位置: ({cube_x:.2f}, {cube_y:.2f}, {cube_z:.2f})")
+        # 更新IK控制器的目标位姿以匹配重置后的状态
+        self.current_pos = self.end_effector.get_pos().cpu().numpy().squeeze()
+        self.current_quat = self.end_effector.get_quat().cpu().numpy().squeeze()
 
-        # 重置计时器
-        self.last_step_time = time.time()
+        print("----------------reset success----------------")
 
         return self.get_observation()
 
     def reset_to(self, state):
+        """
+        根据给定的状态向量重置环境。
+        这是确保回放正确的关键函数。
+        """
         self.simulator.reset()
-        states = state["states"]
-        qpos = states[1:17]
-        robot_joint_pos = qpos[:9]
-        cube_pos = qpos[9:12]
-        cube_quat = qpos[12:16]
 
-        # 设置机器人和立方体状态
-        self.robot.set_dofs_position(robot_joint_pos)
-        cube_entity = self.scene.entities[2]
-        cube_entity.set_pos(cube_pos)
-        cube_entity.set_quat(cube_quat)
+        full_state_vector = state["states"]
 
-        # 更新末端执行器目标状态
+        # 解析状态向量 (必须与 get_state 的结构完全一致)
+        current_idx = 1  # 跳过时间戳
+
+        # 设置机器人状态
+        robot_qpos = full_state_vector[current_idx: current_idx + 9]
+        current_idx += 9
+        robot_qvel = full_state_vector[current_idx: current_idx + 9]
+        current_idx += 9
+        self.robot.set_dofs_position(robot_qpos)
+        self.robot.set_dofs_velocity(robot_qvel)
+
+        # 设置所有可移动物体的状态
+        for obj in self.movable_objects:
+            pos = full_state_vector[current_idx: current_idx + 3]
+            current_idx += 3
+            quat = full_state_vector[current_idx: current_idx + 4]
+            current_idx += 4
+            vel = full_state_vector[current_idx: current_idx + 3]
+            current_idx += 3
+            ang = full_state_vector[current_idx: current_idx + 3]
+            current_idx += 3
+            obj.entity.set_pos(pos)
+            obj.entity.set_quat(quat)
+
+        # 更新IK控制器的目标位姿以匹配重置后的状态
         self.current_pos = self.end_effector.get_pos().cpu().numpy().squeeze()
         self.current_quat = self.end_effector.get_quat().cpu().numpy().squeeze()
 
-        self.last_step_time = time.time()
+        self.scene.step()
         return self.get_observation()
 
+    def get_state(self):
+        """
+        获取当前环境的完整状态向量。
+        其结构必须与数据采集脚本中保存到HDF5文件的结构完全一致。
+        """
+        # 获取机器人状态
+        robot_qpos = self.robot.get_dofs_position().cpu().numpy()
+        robot_qvel = self.robot.get_dofs_velocity().cpu().numpy()
+
+        # 收集所有可移动物体的状态
+        obj_states_flat = []
+        for obj in self.movable_objects:
+            pos, quat, vel, ang = obj.get_state()
+            obj_states_flat.extend(list(pos.flatten()))
+            obj_states_flat.extend(list(quat.flatten()))
+            obj_states_flat.extend(list(vel.flatten()))
+            obj_states_flat.extend(list(ang.flatten()))
+
+        # 按照采集脚本的格式拼接
+        # 格式: [time(1), robot_qpos(9), robot_qvel(9), all_obj_states(N*13)]
+        full_state = np.concatenate(
+            [[time.time()], robot_qpos, robot_qvel, np.array(obj_states_flat)]
+        )
+        return {"states": full_state}
+
     def get_observation(self):
+        """获取 robomimic 格式的观测数据。"""
         joint_pos = self.robot.get_dofs_position().cpu().numpy().copy()
         joint_vel = self.robot.get_dofs_velocity().cpu().numpy().copy()
         eef_pos = self.end_effector.get_pos().cpu().numpy().squeeze().copy()
         eef_quat = self.end_effector.get_quat().cpu().numpy().squeeze().copy()
-        cube_entity = self.scene.entities[2]
+
+        # 获取并拼接所有可移动物体的状态作为 "object" 观测
+        object_states = []
+        for obj in self.movable_objects:
+            pos, quat, _, _ = obj.get_state()
+            object_states.extend(pos)
+            object_states.extend(quat)
 
         obs = {
             "robot0_joint_pos": joint_pos[:7],
@@ -368,127 +379,79 @@ class GenesisEnvWrapper(EB.EnvBase):
             "robot0_gripper_qvel": joint_vel[7:],
             "robot0_eef_pos": eef_pos,
             "robot0_eef_quat": eef_quat,
-            "robot0_eef_vel_lin": self.end_effector.get_vel().cpu().numpy().squeeze().copy(),
-            "robot0_eef_vel_ang": self.end_effector.get_ang().cpu().numpy().squeeze().copy(),
-            "object": np.concatenate([
-                cube_entity.get_pos().cpu().numpy().squeeze().copy(),
-                cube_entity.get_quat().cpu().numpy().squeeze().copy()
-            ]),
+            "object": np.array(object_states),
         }
 
         # 更新摄像头位置并获取图像
         current_q = Quaternion(eef_quat)
         rot_z = Quaternion(axis=[0, 0, 1], angle=-np.pi / 2)
         adjusted_q = current_q * rot_z
-        z_dir = np.array(adjusted_q.rotate([0, 0, 1]))
+        x_dir = np.array(adjusted_q.rotate([1, 0, 0]))
         y_dir = np.array(adjusted_q.rotate([0, 1, 0]))
+        z_dir = np.array(adjusted_q.rotate([0, 0, 1]))
 
-        # Agentview
-        img_agent = self.cameras["agentview"].render(rgb=True)[0].copy()
+        # agentview 是固定的，无需更新
+        img_agent = self.cameras["agentview_image"].render(rgb=True)[0].copy()
         obs["agentview_image"] = img_agent.transpose(2, 0, 1) if self.post_process_images else img_agent
 
-        # Gripper view
-        cam_gripper_pos = eef_pos
-        cam_gripper_lookat = cam_gripper_pos + z_dir * 0.5
-        self.cameras["gripper_view"].set_pose(
-            pos=cam_gripper_pos.astype(np.float32),
-            lookat=cam_gripper_lookat.astype(np.float32),
-            up=y_dir.astype(np.float32)
-        )
-
-        # Eye-in-hand view
-        cam_in_hand_pos = eef_pos + y_dir * 0.05
-        cam_in_hand_lookat = cam_in_hand_pos + z_dir * 0.5
+        # 更新手眼摄像头
+        gripper_cam_pos = eef_pos + y_dir * 0.075 - z_dir * 0.05
+        gripper_cam_lookat = gripper_cam_pos + z_dir * 0.5
         self.cameras["robot0_eye_in_hand_image"].set_pose(
-            pos=cam_in_hand_pos.astype(np.float32),
-            lookat=cam_in_hand_lookat.astype(np.float32),
+            pos=gripper_cam_pos.astype(np.float32),
+            lookat=gripper_cam_lookat.astype(np.float32),
             up=y_dir.astype(np.float32)
         )
         img_hand = self.cameras["robot0_eye_in_hand_image"].render(rgb=True)[0].copy()
         obs["robot0_eye_in_hand_image"] = img_hand.transpose(2, 0, 1) if self.post_process_images else img_hand
 
+        # 更新手腕摄像头
+        wrist_cam_pos = eef_pos
+        wrist_cam_lookat = wrist_cam_pos + z_dir * 0.05
+        self.cameras["robot0_wrist_image"].set_pose(
+            pos=wrist_cam_pos.astype(np.float32),
+            lookat=wrist_cam_lookat.astype(np.float32),
+            up=y_dir.astype(np.float32)
+        )
+        img_wrist = self.cameras["robot0_wrist_image"].render(rgb=True)[0].copy()
+        obs["robot0_wrist_image"] = img_wrist.transpose(2, 0, 1) if self.post_process_images else img_wrist
+
         return obs
 
     def _load_condition_file(self):
+        """从外部文件加载 is_success 函数。"""
         try:
             with open(self.condition_file, 'r') as f:
                 condition_code = f.read()
             local_vars = {}
+            # 提供一个默认的 ConditionContext
+            context = ConditionContext(self.scene, self.robot, self.movable_objects)
             exec(condition_code, globals(), local_vars)
             if 'is_success' in local_vars:
-                self.custom_is_success = local_vars['is_success']
+                # 绑定self和上下文到函数
+                self.custom_is_success = lambda: local_vars['is_success'](context)
+                print(f"成功加载条件文件: {self.condition_file}")
             else:
-                raise ValueError("condition_file 中未定义 is_success 函数")
+                raise ValueError("条件文件中未定义 is_success 函数")
         except Exception as e:
-            print(f"加载 condition_file 失败: {str(e)}")
+            print(f"加载条件文件失败: {str(e)}")
             self.custom_is_success = None
 
     def is_success(self):
-        if self.custom_is_success is not None:
-            return self.custom_is_success.__get__(self, GenesisEnvWrapper)()
-        return {"task": False}
+        """检查任务是否成功。"""
+        if self.custom_is_success:
+            result = self.custom_is_success()
+            # 确保返回的是字典格式
+            return result if isinstance(result, dict) else {"task": bool(result)}
+        return {"task": False}  # 默认返回
 
-    def get_reward(self):
-        return float(self.is_success()["task"])
-
-    def is_done(self):
-        return self.is_success()["task"]
-
-    @property
-    def action_dimension(self):
-        return 7
-
-    @property
-    def name(self):
-        return "Genesis_Franka_Environment"
-
-    @property
-    def type(self):
-        return EnvType.GENESIS
-
-    def serialize(self):
-        return {
-            "type": EnvType.GENESIS,
-            "env_name": "Genesis_Franka_Environment",
-            "env_kwargs": {}
-        }
-
-    def get_state(self):
-        # 状态向量结构必须与数据收集中完全一致
-        # [time(1), robot_qpos(9), cube_pos(3), cube_quat(4), robot_qvel(9), cube_vel(3), cube_ang(3)]
-        # Total: 1 + 9 + 3 + 4 + 9 + 3 + 3 = 32
-        robot_qpos = self.robot.get_dofs_position().cpu().numpy()
-        cube_entity = self.scene.entities[2]
-        cube_pos = cube_entity.get_pos().cpu().numpy().squeeze()
-        cube_quat = cube_entity.get_quat().cpu().numpy().squeeze()
-
-        robot_qvel = self.robot.get_dofs_velocity().cpu().numpy()
-        cube_vel = cube_entity.get_vel().cpu().numpy().squeeze()
-        cube_ang = cube_entity.get_ang().cpu().numpy().squeeze()
-
-        qpos = np.concatenate([robot_qpos, cube_pos, cube_quat])
-        qvel = np.concatenate([robot_qvel, cube_vel, cube_ang])
-
-        full_state = np.concatenate([[time.time()], qpos, qvel])
-
-        return {"states": full_state}
-
-    def get_goal(self):
-        return self.get_observation()
-
-    def set_goal(self, **kwargs):
-        pass
-
-    @property
-    def rollout_exceptions(self):
-        return (Exception,)
-
-    def render(self, mode="human", camera_name="agentview", waitkey=1, **kwargs):
+    def render(self, mode="human", camera_name="agentview_image", waitkey=1, **kwargs):
         if mode == "collect":
             # 获取三个摄像头的图像
-            agent_image = self.cameras["agentview"].render(rgb=True)[0].copy()
+            agent_image = self.cameras["agentview_image"].render(rgb=True)[0].copy()
             eye_image = self.cameras["robot0_eye_in_hand_image"].render(rgb=True)[0].copy()
-            gripper_image = self.cameras["gripper_view"].render(rgb=True)[0].copy()
+            # NOTE: this env defines `robot0_wrist_image` (wrist / gripper-adjacent view), but not `gripper_view`
+            gripper_image = self.cameras["robot0_wrist_image"].render(rgb=True)[0].copy()
 
             # 转换颜色空间并水平拼接
             agent_bgr = cv2.cvtColor(agent_image, cv2.COLOR_RGB2BGR)
@@ -503,8 +466,8 @@ class GenesisEnvWrapper(EB.EnvBase):
         else:
             # 检查摄像头名称是否存在，如果不存在则回退到agentview
             if camera_name not in self.cameras:
-                print(f"Warning: Camera '{camera_name}' not found. Defaulting to 'agentview'.")
-                camera_name = "agentview"
+                print(f"Warning: Camera '{camera_name}' not found. Defaulting to 'agentview_image'.")
+                camera_name = "agentview_image"
 
             cam = self.cameras[camera_name]
             rgb = cam.render(rgb=True)[0].copy()
@@ -517,3 +480,39 @@ class GenesisEnvWrapper(EB.EnvBase):
             elif mode == "rgb_array":
                 return rgb
             return None
+
+    # --- robomimic boilerplate ---
+    @property
+    def action_dimension(self):
+        return 7  # [dx, dy, dz, d_roll, d_pitch, d_yaw, gripper]
+
+    @property
+    def name(self):
+        return "Genesis_Franka_Environment"
+
+    @property
+    def type(self):
+        return EnvType.GENESIS
+
+    def get_reward(self):
+        return float(self.is_success()["task"])
+
+    def is_done(self):
+        return self.is_success()
+
+    def serialize(self):
+        return {
+            "type": EnvType.GENESIS,
+            "env_name": self.name,
+            "env_kwargs": {}
+        }
+
+    @property
+    def rollout_exceptions(self):
+        return (Exception,)
+
+    def get_goal(self):
+        return self.get_observation()
+
+    def set_goal(self, **kwargs):
+        pass
