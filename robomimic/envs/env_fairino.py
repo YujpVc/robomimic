@@ -29,7 +29,7 @@ if FAIRINO_LIB_PATH not in sys.path:
     sys.path.append(FAIRINO_LIB_PATH)
 
 # Import RPC directly from the local library
-from fairino.Robot import RPC, RobotError
+from fairino.Robot import RPC, RobotError # type: ignore
 
 import robomimic.envs.env_base as EB
 import robomimic.utils.obs_utils as ObsUtils
@@ -261,7 +261,7 @@ class DefaultEnvConfig:
     # Position: maximum delta per step (in meters)
     MAX_POS_DELTA = 0.01  # 1cm per step (at 20Hz = 0.2m/s)
     # Rotation: maximum delta per step (in radians)
-    MAX_ROT_DELTA = 0.02   # ~1.1 degrees per step
+    MAX_ROT_DELTA = 0.04   # ~2.2 degrees per step
     
     # Default reset pose
     RESET_POSE = np.zeros((6,))
