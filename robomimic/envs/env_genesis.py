@@ -301,8 +301,12 @@ class GenesisEnvWrapper(EB.EnvBase):
         """重置环境到初始状态，包括对可移动物体位置的随机化。"""
         self.simulator.reset()
 
-        # 重置机器人目标位姿 (使用固定的初始关节配置)
-        self.robot.set_dofs_position(self.init_qpos)
+        # 重置机器人目标位姿 (在固定初始关节配置附近加入小范围随机扰动)
+        # 仅对前 7 个关节（臂部）加入随机偏移，夹爪保持不变
+        noisy_qpos = self.init_qpos.copy()
+        arm_noise = np.random.uniform(-0.05, 0.05, size=7)  # ~±3 度
+        noisy_qpos[:7] += arm_noise
+        self.robot.set_dofs_position(noisy_qpos)
 
         # 重置所有可移动物体位置（带随机偏移）
         for obj in self.movable_objects:
