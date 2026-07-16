@@ -6,6 +6,7 @@ from pyquaternion import Quaternion
 import cv2
 import time
 import os
+import robomimic.utils.obs_utils as ObsUtils
 
 
 # 用于将上下文传递给 is_success 函数的辅助类
@@ -41,7 +42,12 @@ class GenesisEnvWrapper(EB.EnvBase):
         super().__init__(env_config, env_type=EnvType.GENESIS, **kwargs)
 
         self.reward_shaping = False
-        self.post_process_images = False
+        # Keep behavior aligned with other robomimic env wrappers.
+        # Default to raw images for data collection; rollout / policy inference should
+        # explicitly set postprocess_visual_obs=True via env creation utilities.
+        self.post_process_images = bool(kwargs.get("postprocess_visual_obs", False))
+        if self.post_process_images:
+            self._ensure_obs_utils_initialized_for_rgb()
 
         # --- Optional safety gating for IK ---
         # Keep these 3 knobs to avoid IK solutions that are invalid or require a big joint jump ("绕一大圈").
@@ -87,7 +93,7 @@ class GenesisEnvWrapper(EB.EnvBase):
         self.shelf = self.scene.add_entity(
             gs.morphs.MJCF(
                 file="/home/yujp/Genesis/my_models/turbosquid_objects/wooden_shelf/wooden_shelf.xml",
-                pos=(0.6, 0.65, 0.88), quat=(0, 0, 0, 1), scale=1,
+                pos=(0.6, 0.55, 0.88), quat=(0, 0, 0, 1), scale=1,
             )
         )
         self.tray = self.scene.add_entity(
@@ -114,14 +120,14 @@ class GenesisEnvWrapper(EB.EnvBase):
         self.object_2 = self.scene.add_entity(
             gs.morphs.Box(
                 size=(0.04, 0.04, 0.04),
-                pos=(0.75, 1.15, 1.0),
+                pos=(0.7, 1.15, 0.88),
             ),
             surface=gs.surfaces.Default(color=(0.0, 0.0, 1.0)),
         )
         self.object_3 = self.scene.add_entity(
             gs.morphs.Box(
                 size=(0.04, 0.04, 0.04),
-                pos=(0.75, 1.0, 0.88),
+                pos=(0.7, 1.0, 0.88),
             ),
             surface=gs.surfaces.Default(color=(1.0, 1.0, 0.0)),
         )
@@ -184,6 +190,18 @@ class GenesisEnvWrapper(EB.EnvBase):
 
         # 6. 初始化控制状态
         self.init_qpos = np.array([-2.0988, -1.4417,  1.5711, -1.7141,  1.4430,  1.5895,  0.1152,  0.04, 0.04])
+        # reset 时只对末端位置 xyz 做随机，不改旋转
+        self.reset_eef_xyz_noise = np.array(env_config.get("reset_eef_xyz_noise", [0.02, 0.02, 0.02]), dtype=np.float32)
+        self.reset_eef_xyz_noise = np.clip(self.reset_eef_xyz_noise, 0.0, None)
+        # reset 时限制 IK 解相对 init_qpos 的最大跳变（前7轴）
+        self.reset_max_abs_joint_delta = float(env_config.get("reset_max_abs_joint_delta", 0.2))
+        self.reset_ik_max_attempts = int(env_config.get("reset_ik_max_attempts", 8))
+        # 用 init_qpos 标定 reset 的基准末端位姿
+        self.robot.set_dofs_position(self.init_qpos)
+        self.scene.step()
+        self.reset_eef_pos = self.end_effector.get_pos().cpu().numpy().squeeze().copy()
+        self.reset_eef_quat = self.end_effector.get_quat().cpu().numpy().squeeze().copy()
+
         # 将在 reset() 中初始化
         self.current_pos = None
         self.current_quat = None
@@ -193,10 +211,14 @@ class GenesisEnvWrapper(EB.EnvBase):
         env_config = {
             "env_name": env_name if env_name else "Genesis Franka Environment"
         }
+        kwargs = kwargs.copy()
+        # Dataset conversion should store raw images; do not pre-process to CHW/float.
+        kwargs["postprocess_visual_obs"] = False
         env = cls(
             env_config=env_config,
             camera_width=camera_width,
-            camera_height=camera_height
+            camera_height=camera_height,
+            **kwargs
         )
         # 初始化观测规范
         from robomimic.utils.obs_utils import initialize_obs_utils_with_obs_specs
@@ -300,13 +322,73 @@ class GenesisEnvWrapper(EB.EnvBase):
     def reset(self):
         """重置环境到初始状态，包括对可移动物体位置的随机化。"""
         self.simulator.reset()
+        # 回到 init_qpos 作为 reset 种子，减少 IK 多解跳变
+        seed_qpos = self.init_qpos.copy()
+        self.robot.set_dofs_position(seed_qpos)
+        self.scene.step()
 
-        # 重置机器人目标位姿 (在固定初始关节配置附近加入小范围随机扰动)
-        # 仅对前 7 个关节（臂部）加入随机偏移，夹爪保持不变
-        noisy_qpos = self.init_qpos.copy()
-        arm_noise = np.random.uniform(-0.05, 0.05, size=7)  # ~±3 度
-        noisy_qpos[:7] += arm_noise
-        self.robot.set_dofs_position(noisy_qpos)
+        # 使用末端位姿复位：保持基准姿态，仅随机 xyz（不涉及旋转）
+        ik_qpos = None
+        for _ in range(max(1, self.reset_ik_max_attempts)):
+            xyz_noise = np.random.uniform(-self.reset_eef_xyz_noise, self.reset_eef_xyz_noise).astype(np.float32)
+            target_pos = self.reset_eef_pos + xyz_noise
+            target_quat = self.reset_eef_quat.copy()
+            try:
+                ik_result = self.robot.inverse_kinematics(
+                    link=self.end_effector,
+                    pos=target_pos,
+                    quat=target_quat,
+                )
+                if hasattr(ik_result, "detach"):
+                    cand_qpos = ik_result.detach().cpu().numpy().reshape(-1)
+                else:
+                    cand_qpos = np.asarray(ik_result).reshape(-1)
+            except Exception:
+                continue
+
+            if not np.all(np.isfinite(cand_qpos)):
+                continue
+            ik_qpos = cand_qpos
+            break
+
+        if ik_qpos is None:
+            # 兜底：若随机目标 IK 失败，先尝试无噪声基准位姿 IK
+            try:
+                ik_result = self.robot.inverse_kinematics(
+                    link=self.end_effector,
+                    pos=self.reset_eef_pos,
+                    quat=self.reset_eef_quat,
+                )
+                if hasattr(ik_result, "detach"):
+                    cand_qpos = ik_result.detach().cpu().numpy().reshape(-1)
+                else:
+                    cand_qpos = np.asarray(ik_result).reshape(-1)
+                if np.all(np.isfinite(cand_qpos)):
+                    ik_qpos = cand_qpos
+            except Exception:
+                ik_qpos = None
+
+        if ik_qpos is None:
+            # IK 不可用时，保留 reset 后关节
+            ik_qpos = seed_qpos
+        else:
+            # IK 返回维度不足时补齐
+            if ik_qpos.shape[0] < seed_qpos.shape[0]:
+                tmp_q = seed_qpos.copy()
+                tmp_q[:ik_qpos.shape[0]] = ik_qpos
+                ik_qpos = tmp_q
+
+        reset_qpos = ik_qpos.copy()
+        # 限幅前7轴变化，避免 reset 时关节大跳
+        arm_delta = np.clip(
+            reset_qpos[:7] - seed_qpos[:7],
+            -self.reset_max_abs_joint_delta,
+            self.reset_max_abs_joint_delta,
+        )
+        reset_qpos[:7] = seed_qpos[:7] + arm_delta
+        # 夹爪默认张开
+        reset_qpos[7:] = np.array([0.04, 0.04], dtype=reset_qpos.dtype)
+        self.robot.set_dofs_position(reset_qpos)
 
         # 重置所有可移动物体位置（带随机偏移）
         for obj in self.movable_objects:
@@ -316,7 +398,7 @@ class GenesisEnvWrapper(EB.EnvBase):
             reset_pos[1] += rand_offset[1]
             obj.entity.set_pos(reset_pos)
             # 随机旋转（默认只绕 Z 轴随机 yaw，避免把物体“翻倒”）
-            rand_yaw = np.random.uniform(-np.pi, np.pi)
+            rand_yaw = np.random.uniform(-0.2, 0.2)
             q_base = Quaternion(obj.initial_quat.copy())
             q_yaw = Quaternion(axis=[0, 0, 1], angle=rand_yaw)
             q_new = (q_yaw * q_base).normalised
@@ -397,12 +479,64 @@ class GenesisEnvWrapper(EB.EnvBase):
         )
         return {"states": full_state}
 
+    def _world_to_robot_base_pos(self, world_pos):
+        """
+        将世界坐标系下的位置转换到机械臂基坐标系。
+        """
+        base_pos = self.robot.get_pos().cpu().numpy().squeeze().astype(np.float64)
+        base_quat = self.robot.get_quat().cpu().numpy().squeeze().astype(np.float64)
+        rot_base_to_world = Quaternion(base_quat).rotation_matrix
+        return (rot_base_to_world.T @ (np.asarray(world_pos, dtype=np.float64).reshape(3) - base_pos)).astype(np.float32)
+
+    def _process_rgb_obs_strict(self, image, obs_key):
+        """
+        Process RGB observation with strict correctness checks.
+        """
+        if not self.post_process_images:
+            return image
+        obs_map = getattr(ObsUtils, "OBS_KEYS_TO_MODALITIES", None)
+        if (obs_map is None) or (obs_key not in obs_map):
+            raise RuntimeError(
+                "ObsUtils is not initialized for rgb processing. "
+                "Either initialize ObsUtils with observation specs before rollout, "
+                "or create GenesisEnvWrapper with postprocess_visual_obs=False "
+                "(recommended for data collection)."
+            )
+        return ObsUtils.process_obs(obs=image, obs_key=obs_key)
+
+    def _ensure_obs_utils_initialized_for_rgb(self):
+        """
+        Ensure ObsUtils has modality mappings for Genesis observation keys when
+        image post-processing is enabled.
+        """
+        obs_map = getattr(ObsUtils, "OBS_KEYS_TO_MODALITIES", None)
+        required_rgb_keys = {"agentview_image", "robot0_eye_in_hand_image"}
+        if obs_map is not None and required_rgb_keys.issubset(set(obs_map.keys())):
+            return
+
+        from robomimic.utils.obs_utils import initialize_obs_utils_with_obs_specs
+        initialize_obs_utils_with_obs_specs(
+            obs_modality_specs={
+                "obs": {
+                    "low_dim": [
+                        "robot0_joint_pos", "robot0_joint_vel", "robot0_joint_pos_cos",
+                        "robot0_joint_pos_sin", "robot0_gripper_qpos", "robot0_gripper_qvel",
+                        "robot0_eef_pos", "robot0_eef_quat", "robot0_eef_vel_lin",
+                        "robot0_eef_vel_ang", "object",
+                    ],
+                    "rgb": ["agentview_image", "robot0_eye_in_hand_image"],
+                }
+            }
+        )
+
     def get_observation(self):
         """获取 robomimic 格式的观测数据。"""
         joint_pos = self.robot.get_dofs_position().cpu().numpy().copy()
         joint_vel = self.robot.get_dofs_velocity().cpu().numpy().copy()
-        eef_pos = self.end_effector.get_pos().cpu().numpy().squeeze().copy()
+        # 世界坐标系下的末端位姿
+        eef_pos_world = self.end_effector.get_pos().cpu().numpy().squeeze().copy()
         eef_quat = self.end_effector.get_quat().cpu().numpy().squeeze().copy()
+        eef_pos_base = self._world_to_robot_base_pos(eef_pos_world)
 
         # 获取并拼接所有可移动物体的状态作为 "object" 观测
         object_states = []
@@ -418,7 +552,7 @@ class GenesisEnvWrapper(EB.EnvBase):
             "robot0_joint_pos_sin": np.sin(joint_pos[:7]),
             "robot0_gripper_qpos": joint_pos[7:],
             "robot0_gripper_qvel": joint_vel[7:],
-            "robot0_eef_pos": eef_pos,
+            "robot0_eef_pos": eef_pos_base,
             "robot0_eef_quat": eef_quat,
             "object": np.array(object_states),
         }
@@ -433,10 +567,10 @@ class GenesisEnvWrapper(EB.EnvBase):
 
         # agentview 是固定的，无需更新
         img_agent = self.cameras["agentview_image"].render(rgb=True)[0].copy()
-        obs["agentview_image"] = img_agent.transpose(2, 0, 1) if self.post_process_images else img_agent
+        obs["agentview_image"] = self._process_rgb_obs_strict(img_agent, obs_key="agentview_image")
 
         # 更新手眼摄像头
-        gripper_cam_pos = eef_pos + y_dir * 0.075 - z_dir * 0.05
+        gripper_cam_pos = eef_pos_world + y_dir * 0.075 - z_dir * 0.05
         gripper_cam_lookat = gripper_cam_pos + z_dir * 0.5
         self.cameras["show_image"].set_pose(
             pos=gripper_cam_pos.astype(np.float32),
@@ -447,7 +581,7 @@ class GenesisEnvWrapper(EB.EnvBase):
         obs["show_image"] = img_show.transpose(2, 0, 1) if self.post_process_images else img_show
 
         # 更新手腕摄像头
-        wrist_cam_pos = eef_pos
+        wrist_cam_pos = eef_pos_world
         wrist_cam_lookat = wrist_cam_pos + z_dir * 0.05
         self.cameras["robot0_eye_in_hand_image"].set_pose(
             pos=wrist_cam_pos.astype(np.float32),
@@ -455,7 +589,7 @@ class GenesisEnvWrapper(EB.EnvBase):
             up=y_dir.astype(np.float32)
         )
         img_hand = self.cameras["robot0_eye_in_hand_image"].render(rgb=True)[0].copy()
-        obs["robot0_eye_in_hand_image"] = img_hand.transpose(2, 0, 1) if self.post_process_images else img_hand
+        obs["robot0_eye_in_hand_image"] = self._process_rgb_obs_strict(img_hand, obs_key="robot0_eye_in_hand_image")
 
         return obs
 

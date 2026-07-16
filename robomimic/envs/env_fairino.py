@@ -21,6 +21,7 @@ from collections import OrderedDict
 from typing import Optional, Tuple, Any
 import serial
 import binascii
+import cv2
 
 # Add local Fairino_Arm to path to ensure we can import the driver
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -245,11 +246,20 @@ class DefaultEnvConfig:
     # Servo parameters
     CMD_T: float = 0.008  # 8ms servo period (125Hz)
     FILTER_T: float = 0.04 # Filter time constant
+    # Extra interpolation in servo thread (does not change 20Hz env step)
+    SERVO_INTERP_ENABLE: bool = True
+    SERVO_INTERP_ALPHA: float = 0.35
+    SERVO_MAX_STEP_MM: float = 3.0
+    SERVO_MAX_STEP_DEG: float = 2.5
+    SERVO_CMD_VEL: float = 0.8
+    SERVO_RECOVERY_ENABLE: bool = False
+    SERVO_RECOVERY_ERR_STREAK: int = 3
 
     # Camera Config
     REALSENSE_CAMERAS = {
-        'agentview_image': '043422250358', 
-        'robot0_eye_in_hand_image': '140122073169' 
+        # NOTE: Physical camera-to-key mapping corrected to match dataset conventions.
+        'agentview_image': '012322061212',
+        'robot0_eye_in_hand_image': '043422250358',
     }
     IMAGE_CROP = {}
 
@@ -262,11 +272,21 @@ class DefaultEnvConfig:
     MAX_POS_DELTA = 0.01  # 1cm per step (at 20Hz = 0.2m/s)
     # Rotation: maximum delta per step (in radians)
     MAX_ROT_DELTA = 0.04   # ~2.2 degrees per step
-    
+    # If True, action[3:6] is ignored; TCP orientation stays at current pose.
+    DISABLE_ROTATION_CONTROL = False
+
     # Default reset pose
     RESET_POSE = np.zeros((6,))
     # Joint reset target (degrees)
     RESET_JOINT_TARGET = [-90.0, -90.0, -90.0, -90.0, 90.0, 0.0]
+    # reset confirmation mode: "window" | "none"
+    # Keep confirmation in OpenCV window for reuse across scripts.
+    RESET_CONFIRM_MODE = "window"
+    RESET_CONFIRM_KEY = "c"
+    RESET_CONFIRM_WINDOW_TITLE = "Fairino Reset Confirmation"
+    # Policy-time image resize (disabled by default to avoid affecting data collection).
+    POLICY_OBS_RESIZE_ENABLED = False
+    POLICY_OBS_RESIZE_HW = (84, 84)  # (H, W)
 
     RANDOM_RESET = False
     RANDOM_XY_RANGE = (0.0,)
@@ -313,6 +333,11 @@ class FairinoServoController:
         
         # [Fix Jitter] Store last quaternion for continuity check
         self.last_quat = None
+        self._last_target_rpy_deg = None
+        self._servo_fault = False
+        self._last_servo_ret = 0
+        self._last_servo_err_code = None
+        self._last_servo_fault_t = 0.0
 
         if not self.fake_env:
             # Allow error to propagate
@@ -347,9 +372,16 @@ class FairinoServoController:
 
     def set_target_pose(self, pose_7d: np.ndarray):
         """Set the target pose (xyz m + quat xyzw)."""
+        def _wrap_deg(delta):
+            return (delta + 180.0) % 360.0 - 180.0
+
         pose_7d = np.asarray(pose_7d, dtype=np.float64)
         xyz_mm = pose_7d[:3] * 1000.0
         rpy_deg = R.from_quat(pose_7d[3:]).as_euler("xyz", degrees=True)
+        # Keep target RPY continuous to avoid branch jumps near +/-180 deg.
+        if self._last_target_rpy_deg is not None:
+            rpy_deg = self._last_target_rpy_deg + _wrap_deg(rpy_deg - self._last_target_rpy_deg)
+        self._last_target_rpy_deg = rpy_deg.copy()
         desc_pos = np.concatenate([xyz_mm, rpy_deg])
 
         with self.lock:
@@ -365,6 +397,16 @@ class FairinoServoController:
             # Map 0.0-1.0 -> 0-1000
             target = open_amount * 1000.0
             self.gripper_controller.set_target(target)
+
+    def has_servo_fault(self):
+        return self._servo_fault
+
+    def get_last_servo_fault(self):
+        return {
+            "ret": self._last_servo_ret,
+            "robot_error": self._last_servo_err_code,
+            "timestamp": self._last_servo_fault_t,
+        }
 
     def get_state(self):
         """Fetch latest state from robot or cache."""
@@ -416,11 +458,18 @@ class FairinoServoController:
 
     def _servo_loop(self):
         """High frequency control loop."""
+        def _wrap_deg(delta):
+            return (delta + 180.0) % 360.0 - 180.0
+
         # Ensure servo mode is started
         _maybe_call(self.robot, "ServoMoveStart")
         # Give it a moment to initialize
         time.sleep(0.5)
-        
+
+        interp_desc_pos = None
+        servo_err_streak = 0
+        last_err_log_t = 0.0
+
         while self.running:
             t0 = time.time()
             
@@ -428,22 +477,71 @@ class FairinoServoController:
                 target = self._target_desc_pos.copy() if self._target_desc_pos is not None else None
             
             if target is not None:
+                # Interpolate target in servo thread to smooth 20Hz command jumps.
+                if bool(getattr(self.config, "SERVO_INTERP_ENABLE", True)):
+                    if interp_desc_pos is None:
+                        interp_desc_pos = target.copy()
+                    else:
+                        alpha = float(np.clip(getattr(self.config, "SERVO_INTERP_ALPHA", 0.35), 0.0, 1.0))
+                        max_step_mm = float(max(1e-6, getattr(self.config, "SERVO_MAX_STEP_MM", 3.0)))
+                        max_step_deg = float(max(1e-6, getattr(self.config, "SERVO_MAX_STEP_DEG", 2.5)))
+
+                        # XYZ interpolation with per-cycle slew limit
+                        pos_delta = target[:3] - interp_desc_pos[:3]
+                        pos_step = np.clip(alpha * pos_delta, -max_step_mm, max_step_mm)
+                        interp_desc_pos[:3] = interp_desc_pos[:3] + pos_step
+
+                        # RPY interpolation with wrapped angle difference + slew limit
+                        rpy_delta = _wrap_deg(target[3:] - interp_desc_pos[3:])
+                        rpy_step = np.clip(alpha * rpy_delta, -max_step_deg, max_step_deg)
+                        interp_desc_pos[3:] = interp_desc_pos[3:] + rpy_step
+                        interp_desc_pos[3:] = _wrap_deg(interp_desc_pos[3:])
+
+                    send_target = interp_desc_pos
+                else:
+                    send_target = target
+                send_target[3:] = _wrap_deg(send_target[3:])
+
                 # Debug: Ensure target is valid
                 # print(f"ServoCart: {target}")
                 ret = _maybe_call(
                     self.robot, 
                     "ServoCart",
                     0, # mode
-                    target.tolist(),
+                    send_target.tolist(),
                     [1.0]*6, # pos_gain
                     0.0, # acc
-                    0.5, # vel (Reduced from 3.0 for safety/debugging)
+                    float(getattr(self.config, "SERVO_CMD_VEL", 0.8)), # vel
                     self.config.CMD_T, # cmdT
                     self.config.FILTER_T, # filterT
                     0.0 # gain
                 )
                 if ret != 0:
-                    print(f"[ServoError] Ret: {ret}")
+                    servo_err_streak += 1
+                    now_t = time.time()
+                    self._servo_fault = True
+                    self._last_servo_ret = int(ret)
+                    self._last_servo_err_code = _maybe_call(self.robot, "GetRobotErrorCode")
+                    self._last_servo_fault_t = now_t
+                    if now_t - last_err_log_t > 0.5:
+                        print(
+                            f"[ServoError] Ret: {ret}, streak={servo_err_streak}, "
+                            f"robot_error={self._last_servo_err_code}"
+                        )
+                        last_err_log_t = now_t
+
+                    # Auto-recover on repeated servo errors (especially intermittent 112).
+                    if bool(getattr(self.config, "SERVO_RECOVERY_ENABLE", True)) and \
+                        servo_err_streak >= int(getattr(self.config, "SERVO_RECOVERY_ERR_STREAK", 3)):
+                        _maybe_call(self.robot, "ServoMoveEnd")
+                        time.sleep(0.03)
+                        _maybe_call(self.robot, "ResetAllError")
+                        _maybe_call(self.robot, "ServoMoveStart")
+                        time.sleep(0.05)
+                        interp_desc_pos = None
+                        servo_err_streak = 0
+                else:
+                    servo_err_streak = 0
             
             dt = time.time() - t0
             sleep_time = max(0.0, self.config.CMD_T - dt)
@@ -458,7 +556,9 @@ class FairinoServoController:
         self.stop(close_cameras=False)
         time.sleep(0.2)
 
-        _maybe_call(self.robot, "ResetAllError")
+        reset_ret = _maybe_call(self.robot, "ResetAllError")
+        if reset_ret not in (None, 0):
+            print(f"[JointReset] ResetAllError returned: {reset_ret}")
         
         # MoveJ
         print(f"Resetting joints to {target_joints_deg}")
@@ -466,7 +566,7 @@ class FairinoServoController:
             self.robot,
             "MoveJ",
             list(map(float, target_joints_deg)),
-            0, # tool
+            3, # tool
             0, # user
             desc_pos=[0.0]*6,
             vel=20.0,
@@ -476,9 +576,17 @@ class FairinoServoController:
             offset_flag=0,
             offset_pos=[0.0]*6
         )
+        if ret != 0:
+            err_code = _maybe_call(self.robot, "GetRobotErrorCode")
+            raise RuntimeError(
+                f"MoveJ failed before motion. ret={ret}, robot_error={err_code}, "
+                f"target_joints_deg={list(map(float, target_joints_deg))}"
+            )
         
         # Wait for completion
         t_start = time.time()
+        last_curr_q = None
+        last_max_error = None
         while True:
             res_q = _maybe_call(self.robot, "GetActualJointPosDegree", 0)
             if res_q is not None:
@@ -486,12 +594,20 @@ class FairinoServoController:
                     curr_q = np.array(res_q[1], dtype=np.float64)
                     target_q = np.array(target_joints_deg, dtype=np.float64)
                     max_error = np.max(np.abs(curr_q - target_q))
+                    last_curr_q = curr_q
+                    last_max_error = float(max_error)
                     if max_error < 1.0:
                         break
             
             if time.time() - t_start > 15.0:
-                print(f"Warning: joint_reset timed out.")
-                break
+                err_code = _maybe_call(self.robot, "GetRobotErrorCode")
+                raise TimeoutError(
+                    "joint_reset timed out after 15s. "
+                    f"last_max_error_deg={last_max_error}, "
+                    f"last_curr_q_deg={(last_curr_q.tolist() if last_curr_q is not None else None)}, "
+                    f"target_q_deg={list(map(float, target_joints_deg))}, "
+                    f"robot_error={err_code}"
+                )
             time.sleep(0.1)
             
         time.sleep(0.5)
@@ -500,6 +616,11 @@ class FairinoServoController:
             self._target_desc_pos = None
             # Reset last_quat to None to restart continuity check on new episode
             self.last_quat = None
+            self._last_target_rpy_deg = None
+            self._servo_fault = False
+            self._last_servo_ret = 0
+            self._last_servo_err_code = None
+            self._last_servo_fault_t = 0.0
 
         # Restart
         self.start()
@@ -523,6 +644,12 @@ class EnvFairino(EB.EnvBase):
         config = DefaultEnvConfig()
         if "robot_ip" in kwargs:
             config.ROBOT_IP = kwargs["robot_ip"]
+        if "policy_obs_resize_enabled" in kwargs:
+            config.POLICY_OBS_RESIZE_ENABLED = bool(kwargs["policy_obs_resize_enabled"])
+        if "policy_obs_resize_hw" in kwargs:
+            hw = kwargs["policy_obs_resize_hw"]
+            if isinstance(hw, (list, tuple)) and len(hw) == 2:
+                config.POLICY_OBS_RESIZE_HW = (int(hw[0]), int(hw[1]))
 
         self.fake_env = kwargs.get("fake_env", False)
         self.config = config
@@ -563,7 +690,10 @@ class EnvFairino(EB.EnvBase):
         # 2. Compute Next Pose
         nextpos = self.currpos.copy()
         nextpos[:3] = nextpos[:3] + xyz_delta
-        nextpos[3:] = (R.from_euler("xyz", rot_delta) * R.from_quat(self.currpos[3:])).as_quat()
+        if getattr(self.config, "DISABLE_ROTATION_CONTROL", False):
+            nextpos[3:] = self.currpos[3:].copy()
+        else:
+            nextpos[3:] = (R.from_euler("xyz", rot_delta) * R.from_quat(self.currpos[3:])).as_quat()
 
         # 3. Update Controller Target
         self.controller.set_target_pose(nextpos)
@@ -588,6 +718,14 @@ class EnvFairino(EB.EnvBase):
         # 7. Get Obs
         di = self._get_obs()
         self._current_obs = di
+
+        # Strict mode: fail fast on servo errors (no silent fallback).
+        if self.controller.has_servo_fault():
+            fault = self.controller.get_last_servo_fault()
+            raise RuntimeError(
+                f"Servo fault detected: ret={fault['ret']}, robot_error={fault['robot_error']}, "
+                f"timestamp={fault['timestamp']}"
+            )
         
         done = self.curr_path_length >= self.max_episode_length
         reward = 0
@@ -619,7 +757,7 @@ class EnvFairino(EB.EnvBase):
         # Close gripper on reset (Default state)
         self.controller.set_gripper(0.0)
         
-        input(f"Please replace object and press Enter...")
+        self._wait_reset_confirmation()
         
         # Sync state
         self.currpos, _, _, _ = self.controller.get_state()
@@ -628,6 +766,69 @@ class EnvFairino(EB.EnvBase):
         di = self._get_obs()
         self._current_obs = di
         return self.get_observation(di)
+
+    def _wait_reset_confirmation(self):
+        mode = str(getattr(self.config, "RESET_CONFIRM_MODE", "window")).lower()
+        if mode == "none":
+            return
+
+        # Legacy "terminal" mode is mapped to window mode to avoid blocking input().
+        confirm_key = str(getattr(self.config, "RESET_CONFIRM_KEY", "c")).lower()
+        confirm_ord = ord(confirm_key[0]) if len(confirm_key) > 0 else ord("c")
+        window_title = str(getattr(self.config, "RESET_CONFIRM_WINDOW_TITLE", "Fairino Reset Confirmation"))
+        print(f"[Reset] Place object, then press '{chr(confirm_ord)}' in window to continue.")
+        while True:
+            _, _, _, images = self.controller.get_state()
+            frames = []
+            for _, img in images.items():
+                if img is None or not isinstance(img, np.ndarray):
+                    continue
+                vis = img.copy()
+                if len(vis.shape) == 3 and vis.shape[2] == 3:
+                    vis = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+                cv2.putText(
+                    vis,
+                    f"Place object, press '{chr(confirm_ord).upper()}' to continue",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                )
+                frames.append(vis)
+
+            if len(frames) == 0:
+                blank = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(blank, "No camera image", (180, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+                cv2.putText(
+                    blank,
+                    f"Place object, press '{chr(confirm_ord).upper()}' to continue",
+                    (60, 210),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2,
+                )
+                panel = blank
+            else:
+                target_h = min(frame.shape[0] for frame in frames)
+                resized = []
+                for frame in frames:
+                    if frame.shape[0] != target_h:
+                        scale = target_h / frame.shape[0]
+                        new_w = max(1, int(frame.shape[1] * scale))
+                        frame = cv2.resize(frame, (new_w, target_h))
+                    resized.append(frame)
+                panel = np.hstack(resized)
+
+            cv2.imshow(window_title, panel)
+            key = cv2.waitKey(30) & 0xFF
+            if key == confirm_ord:
+                break
+            if key == ord("q"):
+                raise KeyboardInterrupt("Reset canceled from window (q)")
+
+        cv2.destroyWindow(window_title)
     
     def _get_obs(self) -> dict:
         pose_7d, q_deg, g_pos, images = self.controller.get_state()
@@ -673,6 +874,13 @@ class EnvFairino(EB.EnvBase):
         if "images" in di:
              for k, v in di["images"].items():
                 key = k if k.endswith("_image") else f"{k}_image"
+                if (
+                    isinstance(v, np.ndarray)
+                    and len(v.shape) == 3
+                    and bool(getattr(self.config, "POLICY_OBS_RESIZE_ENABLED", False))
+                ):
+                    h, w = getattr(self.config, "POLICY_OBS_RESIZE_HW", (84, 84))
+                    v = cv2.resize(v, (int(w), int(h)), interpolation=cv2.INTER_AREA)
                 ret[key] = v
                 if self.postprocess_visual_obs:
                      # Manually process if modalities not initialized
@@ -745,6 +953,10 @@ class EnvFairino(EB.EnvBase):
     @property
     def type(self):
         return 5 
+
+    @property
+    def version(self):
+        return "1.0.0"
 
     def serialize(self):
         return dict(
